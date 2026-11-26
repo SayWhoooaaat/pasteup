@@ -73,27 +73,40 @@ thumbnail to reopen that document fully editable.
   `Ctrl+=` / `Ctrl+-` (in/out), and `Ctrl`+mouse-wheel.
 
 **Annotation tools**
-- **Rectangle** and **Ellipse** (stroke + optional fill), **Line** and
-  **Arrow** (endpoints on start, end or both; triangle / line (a
-  perpendicular crossbar) / circle shapes, all scaling with the stroke
-  width), **Text**, and **Callout** bubbles with a draggable pointer/tail
+- **Rectangle** and **Ellipse** (outline + optional fill), **Line** and
+  **Arrow**, **Text**, and **Callout** bubbles with a draggable pointer/tail
   (double-click to edit text inline).
+- Each end of a line or arrow picks its own decoration — plain, arrowhead,
+  swept arrowhead, open arrowhead, dot or bar — all scaling with the line
+  width. A line with its ends is painted as one shape, so a see-through
+  arrow has no darker patches where head and shaft meet.
 - Line and Arrow create the same object with identical options — give a line
   arrowheads and it is effectively an arrow — but each item permanently
   remembers which of the two tools made it.
 - The right-hand **Tools panel** puts the tools in a row of icon buttons up
   top (icons are drawn in code — no image assets — and follow the system
   theme). Beneath them it shows only the settings that apply to the active
-  tool or the current selection (fill for shapes, endpoints for lines/arrows,
-  font for text, opacity for everything, images included). Every tool
-  remembers its own style, and editing a selected item
-  updates only its own tool's memory, so the next item you draw looks like
-  the one you just tweaked and the presets never contaminate each other —
-  give a line circle endpoints and every new line keeps them, while arrows
-  stay exactly as you left them.
+  tool or the current selection, and everything is picked **by picture, not
+  by text**:
+  - **Quick styles** — nine ready-made looks per tool, drawn as real
+    examples (red outline, tinted box, yellow highlighter, redaction block,
+    double-headed arrow, white-on-blue callout…). One click sets the lot.
+  - **Colour swatches** for outline, fill and text; the last swatch opens
+    the full colour dialog. Fill has a **no-fill** swatch and a
+    solid / see-through switch.
+  - Line **width**, **dash style** and both **arrow ends** are rows of
+    buttons showing the actual result; text size likewise.
+- Every tool remembers its own style, and editing a selected item updates
+  only its own tool's memory, so the next item you draw looks like the one
+  you just tweaked and the presets never contaminate each other.
 - Tools **stay armed** after you draw, so ten arrows in a row need one click
-  on the Arrow button; the item you just drew stays selected for quick
-  tweaking. Switch back with `V` or the cursor button.
+  on the Arrow button. The item you just drew stays selected and its
+  **handles work straight away** — resize or re-aim it without switching
+  tools. **Esc** returns to the Select tool (and, while typing, keeps the
+  text); a second Esc clears the selection.
+- **Right-click an item** for Copy, Duplicate, Delete, the four arrange
+  commands, Rotate 90° left/right and Flip. Right-click empty canvas for
+  **Paste Here**.
 - **Copy & paste items** (`Ctrl+C` / `Ctrl+V`): duplicates land with a small
   offset, and the clipboard survives switching documents — copy something,
   open another document from the library, paste it there (images included).
@@ -101,14 +114,18 @@ thumbnail to reopen that document fully editable.
   styling, deleting, page resizes (`Ctrl+Z`, `Ctrl+Shift+Z` / `Ctrl+Y`).
 
 **Library / recents**
-- A horizontal **filmstrip** of recent *documents* along the bottom.
+- A horizontal **filmstrip** of recent *documents* along the bottom; the
+  open document is highlighted. **Drag a thumbnail sideways** to rearrange —
+  it follows the cursor slot by slot while the others make room. The mouse
+  wheel scrolls the strip.
+- **Right-click a thumbnail** to Open, **Duplicate** or Delete it.
 - A **Library** button (`Ctrl+G`) opens a gallery of every saved document.
 - Click a thumbnail to reopen that document.
 
 **Output**
-- **Export…** the flattened page to PNG (`Ctrl+E`), **Save to Library**
-  (`Ctrl+S`, forces an immediate document save), or **Copy Image** — the
-  flattened page — to the clipboard (`Ctrl+Shift+C`).
+- **Export…** the flattened page to PNG (`Ctrl+S` or `Ctrl+E`), or **Copy
+  Image** — the flattened page — to the clipboard (`Ctrl+Shift+C`). There is
+  no "save": documents save themselves to the library as you work.
 
 ## Keyboard shortcuts
 
@@ -122,7 +139,8 @@ thumbnail to reopen that document fully editable.
 | Arrow | `A` | Paste | `Ctrl+V` |
 | Text | `T` | Open | `Ctrl+O` |
 | Callout | `C` | Library | `Ctrl+G` |
-| Export | `Ctrl+E` | Save to Library | `Ctrl+S` |
+| Export PNG | `Ctrl+S` / `Ctrl+E` | Duplicate items | `Ctrl+D` |
+| Back to Select / deselect | `Esc` | | |
 | Undo | `Ctrl+Z` | Redo | `Ctrl+Shift+Z` / `Ctrl+Y` |
 | Copy items | `Ctrl+C` | Copy flattened image | `Ctrl+Shift+C` |
 
@@ -135,6 +153,8 @@ pasteup/
   items.py       image + annotation graphics objects (one transform model)
   canvas.py      QGraphicsView/Scene: import, auto-expand, tools, z-order, export
   properties.py  tool buttons + contextual style panel (one style per tool)
+  pickers.py     colour swatches, picture buttons and their preview icons
+  presets.py     the quick styles and the colour palette
   icons.py       tool icons drawn with QPainter (no image assets)
   history.py     snapshot-based undo/redo over the document serialization
   library.py     on-disk storage, filmstrip, gallery

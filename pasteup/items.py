@@ -16,18 +16,19 @@ from PySide6.QtCore import (
     Qt, QEvent, QRectF, QPointF, QSizeF, QByteArray, QBuffer, QIODevice,
 )
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QFont, QFontMetricsF, QPainterPath,
+    QColor, QPen, QFont, QFontMetricsF, QPainterPath,
     QPainterPathStroker, QPixmap, QTransform, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsObject, QGraphicsProxyWidget, QPlainTextEdit,
 )
 
-from .model import Style
+from .model import Style, dash_pattern
 from . import handles as H
 
 
 MIN_SIZE = 10.0
+CALLOUT_FILL = "#fffde7"  # default bubble colour (pale yellow)
 
 
 # --------------------------------------------------------------------------- #
@@ -392,34 +393,99 @@ class EllipseItem(BaseItem):
 # --------------------------------------------------------------------------- #
 #  Line / Arrow
 # --------------------------------------------------------------------------- #
-def _draw_head(painter, tip: QPointF, tail: QPointF, shape: str, size: float,
-               width: float, color: QColor):
-    """Draw an endpoint decoration at ``tip`` pointing away from ``tail``."""
-    ang = math.atan2(tip.y() - tail.y(), tip.x() - tail.x())
-    if shape == "line":
-        # A crossbar perpendicular to the line, exactly as wide as the
-        # stroke and 3x as long, so it scales with the line's thickness.
-        if width <= 0:
-            return
-        pen = QPen(color, width)
-        pen.setCapStyle(Qt.FlatCap)
-        painter.setPen(pen)
-        painter.setBrush(Qt.NoBrush)
-        perp = QPointF(-math.sin(ang), math.cos(ang))
-        half = width * 1.5
-        painter.drawLine(tip + perp * half, tip - perp * half)
-        return
-    painter.setBrush(QBrush(color))
-    pen = QPen(color)
-    pen.setWidthF(1.0)
-    painter.setPen(pen)
-    if shape == "circle":
-        painter.drawEllipse(tip, size * 0.5, size * 0.5)
-        return
-    spread = math.radians(26)  # triangle
-    p1 = tip - QPointF(math.cos(ang - spread) * size, math.sin(ang - spread) * size)
-    p2 = tip - QPointF(math.cos(ang + spread) * size, math.sin(ang + spread) * size)
-    painter.drawPolygon(QPolygonF([tip, p1, p2]))
+def head_size(width: float) -> float:
+    """Length of an arrowhead for a given stroke width."""
+    return 6.0 + 3.2 * width
+
+
+# A line with its end decorations is painted as ONE filled path, not as a
+# stroked line plus separate heads: pieces drawn separately overlap, and at
+# less than full opacity the overlaps show up as darker blobs. The path uses
+# the winding fill rule, under which overlapping pieces simply merge - as long
+# as every piece winds the same way, which the two helpers below guarantee.
+def _capsule(path: QPainterPath, a: QPointF, b: QPointF, r: float):
+    """Add the segment a-b, thickened to radius r with round ends."""
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    length = math.hypot(dx, dy)
+    ux, uy = (dx / length, dy / length) if length > 1e-9 else (1.0, 0.0)
+    n = QPointF(-uy * r, ux * r)
+    ang = math.degrees(math.atan2(-n.y(), n.x()))  # Qt arc angle of +n
+    path.moveTo(a + n)
+    path.lineTo(b + n)
+    path.arcTo(QRectF(b.x() - r, b.y() - r, 2 * r, 2 * r), ang, 180.0)
+    path.lineTo(a - n)
+    path.arcTo(QRectF(a.x() - r, a.y() - r, 2 * r, 2 * r), ang + 180.0, 180.0)
+    path.closeSubpath()
+
+
+def _polygon(path: QPainterPath, pts: list):
+    """Add a closed polygon, wound the same way as _capsule's outlines."""
+    area = sum(p.x() * q.y() - q.x() * p.y()
+               for p, q in zip(pts, pts[1:] + pts[:1]))
+    if area > 0:
+        pts = pts[::-1]
+    path.addPolygon(QPolygonF(pts))
+    path.closeSubpath()
+
+
+def _add_cap(path: QPainterPath, cap: str, tip: QPointF, fwd: QPointF,
+             size: float, r: float) -> float:
+    """Add the decoration `cap` at `tip`, pointing along the unit vector
+    `fwd`. Returns how far the line itself must stop short of the tip so it
+    doesn't poke out through a pointed head."""
+    n = QPointF(-fwd.y(), fwd.x())
+    back = tip - fwd * size
+    if cap == "triangle":
+        hw = size * 0.42
+        _polygon(path, [tip, back + n * hw, back - n * hw])
+        return size * 0.9
+    if cap == "stealth":
+        hw = size * 0.48
+        _polygon(path, [tip, back + n * hw, tip - fwd * (size * 0.68),
+                        back - n * hw])
+        return size * 0.6
+    if cap == "open":
+        hw = size * 0.42
+        _capsule(path, back + n * hw, tip, r)
+        _capsule(path, back - n * hw, tip, r)
+    elif cap == "circle":
+        _capsule(path, tip, tip, max(size * 0.3, r + 1.5))
+    elif cap == "bar":
+        half = size * 0.5
+        _polygon(path, [tip + n * half + fwd * r, tip - n * half + fwd * r,
+                        tip - n * half - fwd * r, tip + n * half - fwd * r])
+    return 0.0
+
+
+def line_path(p1: QPointF, p2: QPointF, style: Style) -> QPainterPath:
+    """The complete filled outline of a line/arrow from p1 to p2: the
+    (possibly dashed) shaft plus the decoration on each end."""
+    path = QPainterPath()
+    path.setFillRule(Qt.WindingFill)
+    w = max(1.0, float(style.width))
+    r = w / 2.0
+    dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return path
+    u = QPointF(dx / length, dy / length)
+    # heads never grow longer than the line has room for
+    pointed = sum(c in ("triangle", "stealth")
+                  for c in (style.start_cap, style.end_cap))
+    size = min(head_size(w), length / max(1, pointed))
+    a = p1 + u * _add_cap(path, style.start_cap, p1, -u, size, r)
+    b = p2 - u * _add_cap(path, style.end_cap, p2, u, size, r)
+    pat = dash_pattern(style.dash, w)
+    if pat is None:
+        _capsule(path, a, b, r)
+        return path
+    on, period = pat[0] * w, (pat[0] + pat[1]) * w
+    span = math.hypot(b.x() - a.x(), b.y() - a.y())
+    t = 0.0
+    while t < span:
+        _capsule(path, a + u * t, a + u * min(t + on, span), r)
+        t += period
+    return path
 
 
 def _snap_angle(anchor: QPointF, point: QPointF, step: float = 15.0) -> QPointF:
@@ -445,6 +511,8 @@ class LineItem(BaseItem):
         super().__init__(style)
         self._p1 = p1 or QPointF(0, 0)
         self._p2 = p2 or QPointF(1, 0)
+        self._path_key = None    # memo for _path(): rebuilt only when the
+        self._path_cache = None  # endpoints or the relevant style change
         self._recalc_rect()
 
     def _recalc_rect(self):
@@ -541,23 +609,22 @@ class LineItem(BaseItem):
         self._apply_transform()
 
     def content_margin(self) -> float:
-        return self._style.width / 2.0 + self._head_size() + 4.0
+        w = max(1.0, float(self._style.width))
+        return w / 2.0 + head_size(w) * 0.5 + 4.0
 
-    def _head_size(self) -> float:
-        return 8.0 + self._style.width * 2.0
+    def _path(self) -> QPainterPath:
+        st = self._style
+        key = (self._p1.x(), self._p1.y(), self._p2.x(), self._p2.y(),
+               st.width, st.dash, st.start_cap, st.end_cap)
+        if key != self._path_key:
+            self._path_key = key
+            self._path_cache = line_path(self._p1, self._p2, st)
+        return self._path_cache
 
     def paint_content(self, painter):
-        painter.setPen(self._style.pen())
-        painter.setBrush(Qt.NoBrush)
-        painter.drawLine(self._p1, self._p2)
-        size = self._head_size()
-        color = QColor(self._style.stroke)
-        if self._style.arrow_end:
-            _draw_head(painter, self._p2, self._p1, self._style.arrow_shape,
-                       size, self._style.width, color)
-        if self._style.arrow_start:
-            _draw_head(painter, self._p1, self._p2, self._style.arrow_shape,
-                       size, self._style.width, color)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self._style.stroke))
+        painter.drawPath(self._path())
 
     def shape(self):
         path = QPainterPath()
@@ -576,17 +643,17 @@ class LineItem(BaseItem):
 #  Editable text base
 # --------------------------------------------------------------------------- #
 class _TextEdit(QPlainTextEdit):
-    def __init__(self, on_commit, on_cancel):
+    def __init__(self, on_commit, on_escape):
         super().__init__()
         self._on_commit = on_commit
-        self._on_cancel = on_cancel
+        self._on_escape = on_escape
         self.setFrameStyle(0)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self._on_cancel()
+            self._on_escape()
             return
         super().keyPressEvent(event)
 
@@ -619,7 +686,7 @@ class _TextHostMixin:
         if getattr(self, "_editor", None) is not None:
             return
         self._editor_proxy = QGraphicsProxyWidget(self)
-        editor = _TextEdit(self._commit_edit, self._cancel_edit)
+        editor = _TextEdit(self._commit_edit, self._escape_edit)
         editor.setFont(self._font())
         editor.setStyleSheet(
             "QPlainTextEdit{background:rgba(255,255,255,0.85);"
@@ -652,12 +719,14 @@ class _TextHostMixin:
         self._set_text_and_fit(text)
         self.update()
 
-    def _cancel_edit(self):
-        self._teardown_editor()
-        if not self._text:
-            if self.scene():
-                self.scene().removeItem(self)
-        self.update()
+    def _escape_edit(self):
+        """Esc while typing: keep the text, then let the view do what Esc
+        does everywhere else (return to the Select tool)."""
+        sc = self.scene()
+        self._commit_edit()  # may remove an empty item from the scene
+        for view in (sc.views() if sc is not None else ()):
+            if hasattr(view, "escape"):
+                view.escape()
 
     def mouseDoubleClickEvent(self, event):
         self.start_editing()
@@ -779,10 +848,7 @@ class CalloutItem(_TextHostMixin, BaseItem):
 
     def paint_content(self, painter):
         painter.setPen(self._style.pen())
-        fill = self._style.brush()
-        if not self._style.fill_enabled:
-            fill = QBrush(QColor("#fffde7"))
-        painter.setBrush(fill)
+        painter.setBrush(self._style.brush())
         painter.drawPath(self._bubble_path())
         if getattr(self, "_editor", None) is None:
             painter.setFont(self._font())
@@ -801,6 +867,12 @@ class CalloutItem(_TextHostMixin, BaseItem):
 def item_from_dict(d: dict) -> BaseItem:
     kind = d.get("kind")
     style = Style.from_dict(d.get("style", {}))
+    if (kind == "callout" and not style.fill_enabled
+            and "start_cap" not in d.get("style", {})):
+        # older documents: an "unfilled" callout was painted pale yellow.
+        # "No fill" now really means transparent, so pin the old look down.
+        style.fill = QColor(CALLOUT_FILL)
+        style.fill_enabled = True
     if kind == "image":
         it = ImageItem(pixmap_from_b64(d["image"]), style)
         it._b64 = d["image"]  # keep the exact source bytes; skip a re-encode

@@ -21,8 +21,8 @@ import time
 from PySide6.QtCore import Qt, QSize, Signal, QStandardPaths, QTimer
 from PySide6.QtGui import QIcon, QPixmap, QImage
 from PySide6.QtWidgets import (
-    QListWidget, QListWidgetItem, QDialog, QVBoxLayout, QLabel, QMenu,
-    QMessageBox,
+    QApplication, QListWidget, QListWidgetItem, QDialog, QVBoxLayout, QLabel,
+    QMenu, QMessageBox,
 )
 
 
@@ -124,6 +124,24 @@ def list_documents() -> list[str]:
     return result
 
 
+def duplicate_document(path: str) -> str:
+    """Copy a document (and its thumbnail); the copy is placed right after
+    the original in the display order. Returns the copy's path."""
+    names = [os.path.basename(p) for p in list_documents()]
+    new = new_document_path()
+    while os.path.exists(new):  # two copies within the same millisecond
+        time.sleep(0.002)
+        new = new_document_path()
+    shutil.copyfile(path, new)
+    if os.path.exists(thumb_path(path)):
+        shutil.copyfile(thumb_path(path), thumb_path(new))
+    name = os.path.basename(path)
+    at = names.index(name) + 1 if name in names else 0
+    names.insert(at, os.path.basename(new))
+    write_order(names)
+    return new
+
+
 def delete_document(path: str):
     for p in (path, thumb_path(path)):
         try:
@@ -141,20 +159,43 @@ def _label(doc_path: str) -> str:
     return time.strftime("%b %d  %H:%M", time.localtime(created_time(doc_path)))
 
 
+_icon_cache: dict = {}  # (thumbnail path, w, h) -> (mtime, QIcon)
+
+
 def _icon(doc_path: str, size: QSize) -> QIcon:
-    pix = QPixmap(thumb_path(doc_path))
-    if pix.isNull():
+    """The document's thumbnail, re-read only when its file has changed —
+    the strip is refreshed on every auto-save."""
+    thumb = thumb_path(doc_path)
+    try:
+        mtime = os.stat(thumb).st_mtime_ns
+    except OSError:
         return QIcon()
-    return QIcon(pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    key = (thumb, size.width(), size.height())
+    hit = _icon_cache.get(key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    pix = QPixmap(thumb)
+    icon = QIcon()
+    if not pix.isNull():
+        pix = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        icon.addPixmap(pix, QIcon.Normal)
+        # same picture when selected: the default blue wash hides it, and
+        # the highlighted label already shows which document is open
+        icon.addPixmap(pix, QIcon.Selected)
+    _icon_cache[key] = (mtime, icon)
+    return icon
 
 
 class _DocList(QListWidget):
     docActivated = Signal(str)
     docDeleted = Signal(str)
+    docDuplicateRequested = Signal(str)
 
     def __init__(self, icon_size: QSize = THUMB):
         super().__init__()
         self._isize = icon_size
+        self._current_path = None   # the document open in the editor
+        self._mute_clicks = False
         self.setViewMode(QListWidget.IconMode)
         self.setIconSize(icon_size)
         self.setResizeMode(QListWidget.Adjust)
@@ -166,7 +207,21 @@ class _DocList(QListWidget):
         self.customContextMenuRequested.connect(self._context_menu)
 
     def _activated(self, item: QListWidgetItem):
-        self.docActivated.emit(item.data(Qt.UserRole))
+        if not self._mute_clicks:
+            self.docActivated.emit(item.data(Qt.UserRole))
+
+    def set_current(self, path: str | None):
+        """Highlight the document that is open in the editor."""
+        self._current_path = path
+        self._mark_current()
+
+    def _mark_current(self):
+        for i in range(self.count()):
+            if self.item(i).data(Qt.UserRole) == self._current_path:
+                self.setCurrentRow(i)
+                return
+        self.setCurrentRow(-1)
+        self.clearSelection()
 
     # -- right-click ------------------------------------------------------
     def _context_menu(self, pos):
@@ -176,11 +231,14 @@ class _DocList(QListWidget):
         path = item.data(Qt.UserRole)
         menu = QMenu(self)
         act_open = menu.addAction("Open")
+        act_dup = menu.addAction("Duplicate")
         menu.addSeparator()
         act_del = menu.addAction("Delete…")
         chosen = menu.exec(self.viewport().mapToGlobal(pos))
         if chosen == act_open:
             self.docActivated.emit(path)
+        elif chosen == act_dup:
+            self.docDuplicateRequested.emit(path)
         elif chosen == act_del:
             self._confirm_delete(path)
 
@@ -196,43 +254,150 @@ class _DocList(QListWidget):
         self.docDeleted.emit(path)
 
     def reload(self, paths: list[str] | None = None):
-        self.clear()
-        for p in (paths if paths is not None else list_documents()):
-            it = QListWidgetItem(_icon(p, self._isize), _label(p))
-            it.setData(Qt.UserRole, p)
-            it.setToolTip(os.path.basename(p))
-            self.addItem(it)
+        paths = list(paths if paths is not None else list_documents())
+        shown = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+        if shown == paths:
+            # same documents in the same order (the usual auto-save case):
+            # just refresh the pictures, keeping scroll position and all
+            for i, p in enumerate(paths):
+                self.item(i).setIcon(_icon(p, self._isize))
+        else:
+            scroll = self.horizontalScrollBar().value()
+            self.clear()
+            for p in paths:
+                it = QListWidgetItem(_icon(p, self._isize), _label(p))
+                it.setData(Qt.UserRole, p)
+                it.setToolTip(os.path.basename(p))
+                self.addItem(it)
+            self.horizontalScrollBar().setValue(scroll)
+        self._mark_current()
 
 
 class Filmstrip(_DocList):
-    """Horizontal recent-documents strip. Drag thumbnails to rearrange."""
+    """Horizontal recent-documents strip. Drag a thumbnail sideways to
+    rearrange: it follows the cursor from slot to slot, the others making
+    room as it passes (like reordering browser tabs)."""
 
     MAX = 40
+    CELL = QSize(THUMB.width() + 14, THUMB.height() + 22)
+    EDGE = 28  # px from either end where a drag starts scrolling the strip
     orderChanged = Signal()
 
     def __init__(self):
         super().__init__(THUMB)
         self.setFlow(QListWidget.LeftToRight)
         self.setWrapping(False)
+        self.setGridSize(self.CELL)       # equal slots: reordering is exact
+        self.setUniformItemSizes(True)
         self.setFixedHeight(THUMB.height() + 40)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # drag to rearrange
-        self.setMovement(QListWidget.Snap)
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
-        self.setDragDropMode(QListWidget.InternalMove)
-        self.setDefaultDropAction(Qt.MoveAction)
+        self.setHorizontalScrollMode(QListWidget.ScrollPerPixel)
+        self.horizontalScrollBar().setSingleStep(self.CELL.width() // 3)
+        # Reordering is done by hand in the mouse handlers below rather than
+        # with Qt's item drag-and-drop, which in icon mode moves pictures
+        # around without changing the underlying order.
+        self.setDragEnabled(False)
+        self._press_item = None
+        self._press_pos = None
+        self._dragging = False
+        self._drag_x = 0
+        self._reload_pending = False
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(30)
+        self._edge_timer.timeout.connect(self._edge_scroll)
 
     def reload(self, paths=None):
-        super().reload((paths if paths is not None else list_documents())[: self.MAX])
+        if self._press_item is not None:
+            # the mouse is down on a thumbnail (possibly mid-drag);
+            # rebuilding now would pull it out from under the cursor
+            self._reload_pending = True
+            return
+        super().reload(
+            (paths if paths is not None else list_documents())[: self.MAX])
 
-    def dropEvent(self, event):
-        super().dropEvent(event)
-        self._persist_order()
-        # rebuild from the saved order so the strip is always tidy
-        QTimer.singleShot(0, self.reload)
+    def wheelEvent(self, event):
+        # a plain mouse wheel scrolls the strip sideways
+        d = event.angleDelta()
+        delta = d.x() if abs(d.x()) > abs(d.y()) else d.y()
+        bar = self.horizontalScrollBar()
+        bar.setValue(bar.value() - delta)
+        event.accept()
+
+    # -- drag to rearrange --------------------------------------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_item = self.itemAt(event.position().toPoint())
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_item is None or not (event.buttons() & Qt.LeftButton):
+            return super().mouseMoveEvent(event)
+        pos = event.position().toPoint()
+        if not self._dragging:
+            if ((pos - self._press_pos).manhattanLength()
+                    < QApplication.startDragDistance()):
+                return
+            self._dragging = True
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            self.setCurrentItem(self._press_item)
+        self._drag_x = pos.x()
+        self._move_dragged()
+        near_edge = (pos.x() < self.EDGE
+                     or pos.x() > self.viewport().width() - self.EDGE)
+        if near_edge and not self._edge_timer.isActive():
+            self._edge_timer.start()
+        elif not near_edge:
+            self._edge_timer.stop()
+        event.accept()
+
+    def _move_dragged(self):
+        """Put the dragged thumbnail into the slot under the cursor."""
+        item = self._press_item
+        x = self._drag_x + self.horizontalScrollBar().value()
+        target = max(0, min(self.count() - 1, x // self.CELL.width()))
+        row = self.row(item)
+        if row < 0 or target == row:
+            return
+        self.takeItem(row)
+        self.insertItem(target, item)
+        self.setCurrentItem(item)
+
+    def _edge_scroll(self):
+        bar = self.horizontalScrollBar()
+        step = -14 if self._drag_x < self.EDGE else 14
+        bar.setValue(bar.value() + step)
+        self._move_dragged()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._end_drag()
+        # releasing over the thumbnail just dragged must not also open it
+        self._mute_clicks = True
+        try:
+            super().mouseReleaseEvent(event)
+        finally:
+            self._mute_clicks = False
+
+    def _end_drag(self):
+        was_dragging = self._dragging
+        clicked = self._press_item
+        self._press_item = None
+        self._dragging = False
+        self._edge_timer.stop()
+        pending, self._reload_pending = self._reload_pending, False
+        if was_dragging:
+            self.viewport().unsetCursor()
+            self._persist_order()
+            QTimer.singleShot(0, self.reload)
+        elif clicked is not None:
+            # a plain click: open it (deferred, so the list isn't rebuilt
+            # in the middle of its own mouse handling)
+            path = clicked.data(Qt.UserRole)
+            QTimer.singleShot(0, lambda: self.docActivated.emit(path))
+        elif pending:
+            QTimer.singleShot(0, self.reload)
 
     def _persist_order(self):
         names = []
@@ -264,6 +429,10 @@ class GalleryDialog(QDialog):
         self.list = _DocList(QSize(180, 140))
         self.list.docActivated.connect(self._pick)
         self.list.docDeleted.connect(lambda _p: self.reload())
+        # set by the opener; duplicating needs the main window's help (the
+        # open document must be saved first), after which we just re-list
+        self.list.docDuplicateRequested.connect(
+            lambda _p: QTimer.singleShot(0, self.reload))
         lay.addWidget(self.list)
         self.reload()
 

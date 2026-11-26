@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import Qt, QEvent, QRectF, QPointF, QByteArray, QMimeData, Signal
+from PySide6.QtCore import (
+    Qt, QEvent, QRectF, QPoint, QPointF, QByteArray, QMimeData, Signal,
+)
 from PySide6.QtGui import (
     QImage, QPainter, QPixmap, QColor, QGuiApplication, QPen, QBrush,
 )
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QGraphicsProxyWidget
 
 from .model import Style
+from . import handles as H
 from . import items as I
 
 
@@ -240,6 +243,9 @@ class Canvas(QGraphicsView):
     imageImported = Signal(QImage)  # emitted when a raster image enters the scene
     toolChanged = Signal(str)       # the active tool id changed
     zoomChanged = Signal(float)     # current zoom factor (1.0 == 100%)
+    # right-click: (global position for the menu, scene position under it).
+    # The selection has already been set to what was clicked.
+    menuRequested = Signal(QPoint, QPointF)
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 8.0
@@ -269,8 +275,10 @@ class Canvas(QGraphicsView):
         # independent even though both create the same item kind.
         self.tool_styles = {
             RECT: Style(), ELLIPSE: Style(),
-            LINE: Style(), ARROW: Style(arrow_end=True),
-            TEXT: Style(), CALLOUT: Style(), "image": Style(),
+            LINE: Style(), ARROW: Style(end_cap="triangle"),
+            TEXT: Style(),
+            CALLOUT: Style(fill=QColor(I.CALLOUT_FILL), fill_enabled=True),
+            "image": Style(),
         }
         self.tool = SELECT
         self._new_item = None
@@ -338,7 +346,13 @@ class Canvas(QGraphicsView):
         QGuiApplication.clipboard().setMimeData(md)
         return True
 
-    def _paste_items(self, dicts: list) -> bool:
+    def duplicate_selection(self) -> bool:
+        """Copy the selection in place (slightly offset), leaving the
+        clipboard alone."""
+        sel = sorted(self.selected_items(), key=lambda it: it.zValue())
+        return bool(sel) and self._paste_items([it.to_dict() for it in sel])
+
+    def _paste_items(self, dicts: list, at: QPointF | None = None) -> bool:
         try:
             items = [I.item_from_dict(d) for d in dicts]
         except (KeyError, TypeError, ValueError):
@@ -349,17 +363,26 @@ class Canvas(QGraphicsView):
         for it in items:
             it.setZValue(z)
             z += 1
-            # slight offset so an in-place duplicate is visibly a copy
-            it.setPos(it.pos() + QPointF(12, 12))
+            if at is None:
+                # slight offset so an in-place duplicate is visibly a copy
+                it.setPos(it.pos() + QPointF(12, 12))
             self.scene_.addItem(it)
             it.setSelected(True)
             r = it.sceneBoundingRect()
             rect = r if rect is None else rect.united(r)
+        if rect is not None and at is not None:
+            # pasting at a chosen spot: centre the whole group on it
+            delta = at - rect.center()
+            for it in items:
+                it.setPos(it.pos() + delta)
+            rect.translate(delta)
         if rect is not None:
             self.scene_.grow_to_include(rect)
         return True
 
-    def paste_clipboard(self):
+    def paste_clipboard(self, at: QPointF | None = None):
+        """Paste items or an image. `at` (scene coords) places the paste
+        there instead of at the default spot."""
         cb = QGuiApplication.clipboard()
         md = cb.mimeData()
         if md.hasFormat(ITEMS_MIME):
@@ -367,12 +390,12 @@ class Canvas(QGraphicsView):
                 dicts = json.loads(bytes(md.data(ITEMS_MIME)).decode())
             except ValueError:
                 dicts = None
-            if dicts and self._paste_items(dicts):
+            if dicts and self._paste_items(dicts, at):
                 return True
         if md.hasImage():
             img = cb.image()
             if not img.isNull():
-                self.add_pixmap(QPixmap.fromImage(img))
+                self.add_pixmap(QPixmap.fromImage(img), at)
                 return True
         if md.hasUrls():
             ok = False
@@ -585,13 +608,21 @@ class Canvas(QGraphicsView):
                     self.scene_._begin_page_drag(role)
                     event.accept()
                     return
+        if event.button() == Qt.RightButton:
+            # the context menu does everything a right-click needs (see
+            # contextMenuEvent); letting the press through as well would
+            # start a rubber band or drop the selection underneath the menu
+            event.accept()
+            return
         if self.tool == SELECT or event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
         if isinstance(self.itemAt(event.position().toPoint()),
-                      QGraphicsProxyWidget):
-            # tools stay armed after placing an item, so a click inside an
-            # open inline text editor must reach the editor, not spawn
-            # another item underneath it
+                      (QGraphicsProxyWidget, H.HandleItem)):
+            # tools stay armed after placing an item, so:
+            #  - a press on a resize/rotate handle of the item just drawn
+            #    must work that handle, not start another item on top of it
+            #  - a click inside an open inline text editor must reach the
+            #    editor, not spawn another item underneath it
             return super().mousePressEvent(event)
         self._start = self.mapToScene(event.position().toPoint())
         item = self._make_item()
@@ -680,9 +711,43 @@ class Canvas(QGraphicsView):
         event.accept()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape and self._grip_drag is not None:
-            self._grip_drag = None
-            self.scene_.cancel_page_resize()
+        if event.key() == Qt.Key_Escape:
+            if isinstance(self.scene_.focusItem(), QGraphicsProxyWidget):
+                # an inline text editor is open: it gets the key, keeps its
+                # text and then calls escape() itself
+                return super().keyPressEvent(event)
+            self.escape()
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def escape(self):
+        """Esc: back out of whatever is going on, one level at a time —
+        an active drag, else the armed drawing tool, else the selection."""
+        if self._grip_drag is not None:
+            self._grip_drag = None
+            self.scene_.cancel_page_resize()
+        elif self._new_item is not None:
+            self.scene_.removeItem(self._new_item)
+            self._new_item = None
+        elif self.tool != SELECT:
+            self.set_tool(SELECT)
+        else:
+            self.scene_.clearSelection()
+
+    # -- right-click --------------------------------------------------------
+    def contextMenuEvent(self, event):
+        if self._new_item is not None or self._grip_drag is not None:
+            return
+        hit = self.itemAt(event.pos())
+        if isinstance(hit, QGraphicsProxyWidget):
+            return super().contextMenuEvent(event)  # the text editor's menu
+        while hit is not None and not isinstance(hit, I.BaseItem):
+            hit = hit.parentItem()  # a handle stands for its item
+        if hit is None:
+            self.scene_.clearSelection()
+        elif not hit.isSelected():
+            self.scene_.clearSelection()
+            hit.setSelected(True)
+        self.menuRequested.emit(event.globalPos(), self.mapToScene(event.pos()))
+        event.accept()
